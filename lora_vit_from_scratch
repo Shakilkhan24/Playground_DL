@@ -1,3 +1,11 @@
+# Notion : https://www.notion.so/Lora-and-VIT-e3aac1b6772f4a638401d3a3a770509f?showMoveTo=true&saveParent=true
+
+
+
+
+
+
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
