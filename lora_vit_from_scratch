@@ -1,0 +1,203 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+
+# Patch Embedding Layer
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size, patch_size, in_channels, embed_dim):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x)  # (B, embed_dim, n_patches**0.5, n_patches**0.5)
+        x = x.flatten(2)  # (B, embed_dim, n_patches)
+        x = x.transpose(1, 2)  # (B, n_patches, embed_dim)
+        return x
+
+# Attention Layer
+class Attention(nn.Module):
+    def __init__(self, dim, n_heads=12, qkv_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.n_heads = n_heads
+        self.scale = (dim // n_heads) ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, C // self.n_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+# MLP Layer
+class MLP(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features, drop=0.):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+# Transformer Block
+class Block(nn.Module):
+    def __init__(self, dim, n_heads, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, n_heads=n_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, int(dim * mlp_ratio), dim, drop=drop)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+# Vision Transformer Model
+class VisionTransformer(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, n_classes=1000, embed_dim=768, depth=12,
+                 n_heads=12, mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0.):
+        super().__init__()
+        self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
+        n_patches = self.patch_embed.n_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        self.blocks = nn.ModuleList([
+            Block(embed_dim, n_heads, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate)
+            for _ in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, n_classes)
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        x = x[:, 0]  # Use only the cls token for classification
+        x = self.head(x)
+        return x
+
+# LoRA Layer
+class LoRALayer(nn.Module):
+    def __init__(self, in_features, out_features, rank=4, alpha=1):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.alpha = alpha
+
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+        self.scaling = alpha / rank
+
+    def forward(self, x):
+        return (self.lora_B @ self.lora_A @ x.T).T * self.scaling
+
+# LoRA-Enhanced Linear Layer
+class LoRALinear(nn.Linear):
+    def __init__(self, in_features, out_features, rank=4, alpha=1, bias=True):
+        super().__init__(in_features, out_features, bias)
+        self.lora = LoRALayer(in_features, out_features, rank, alpha)
+        
+        # Freeze the original weights
+        self.weight.requires_grad = False
+
+    def forward(self, x):
+        return super().forward(x) + self.lora(x)
+
+# Function to add LoRA to a Linear layer
+def add_lora_to_linear(layer, rank=4, alpha=1):
+    if isinstance(layer, nn.Linear):
+        return LoRALinear(layer.in_features, layer.out_features, rank, alpha, bias=layer.bias is not None)
+    else:
+        return layer
+
+# Function to add LoRA to the Vision Transformer
+def add_lora_to_vit(model, rank=4, alpha=1):
+    for name, module in model.named_modules():
+        if isinstance(module, Attention):
+            module.qkv = add_lora_to_linear(module.qkv, rank, alpha)
+            module.proj = add_lora_to_linear(module.proj, rank, alpha)
+        elif isinstance(module, MLP):
+            module.fc1 = add_lora_to_linear(module.fc1, rank, alpha)
+            module.fc2 = add_lora_to_linear(module.fc2, rank, alpha)
+    return model
+
+# Create a ViT model
+vit_model = VisionTransformer(img_size=224, patch_size=16, in_channels=3, n_classes=1000, embed_dim=768, depth=12, n_heads=12)
+
+# Add LoRA to the ViT model
+lora_vit_model = add_lora_to_vit(vit_model, rank=4, alpha=16)
+
+# Function to count trainable parameters
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+print(f"Trainable parameters in LoRA ViT: {count_parameters(lora_vit_model)}")
+print(f"Trainable parameters in original ViT: {count_parameters(vit_model)}")
+
+# Example training loop
+def train_lora_vit(model, train_loader, epochs=10, lr=1e-3):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+
+    model.train()
+    for epoch in range(epochs):
+        for batch_idx, (data, target) in enumerate(train_loader):
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+
+            if batch_idx % 100 == 0:
+                print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item()}')
+
+# Assuming you have a train_loader
+# train_lora_vit(lora_vit_model, train_loader)
+
+# Inference example
+def inference_example(model, image):
+    model.eval()
+    with torch.no_grad():
+        output = model(image)
+    return output
